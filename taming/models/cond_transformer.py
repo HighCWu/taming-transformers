@@ -19,7 +19,8 @@ class Net2NetTransformer(pl.LightningModule):
                  first_stage_key="image",
                  cond_stage_key="depth",
                  downsample_cond_size=-1,
-                 pkeep=1.0):
+                 pkeep=1.0,
+                 share_vocab=True):
 
         super().__init__()
         self.init_first_stage_from_ckpt(first_stage_config)
@@ -35,6 +36,7 @@ class Net2NetTransformer(pl.LightningModule):
         self.cond_stage_key = cond_stage_key
         self.downsample_cond_size = downsample_cond_size
         self.pkeep = pkeep
+        self.share_vocab = share_vocab
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -53,6 +55,11 @@ class Net2NetTransformer(pl.LightningModule):
         self.first_stage_model = model
 
     def init_cond_stage_from_ckpt(self, config):
+        if self.first_stage_model.use_cond:
+            self.cond_in_first = True
+            self.cond_stage_model = self.first_stage_model.cond_stage_model
+            del self.first_stage_model.cond_stage_model
+            return
         model = instantiate_from_config(config)
         model = model.eval()
         model.train = disabled_train
@@ -60,8 +67,8 @@ class Net2NetTransformer(pl.LightningModule):
 
     def forward(self, x, c):
         # one step to produce the logits
-        _, z_indices = self.encode_to_z(x)
         _, c_indices = self.encode_to_c(c)
+        _, z_indices = self.encode_to_z(x)
 
         if self.training and self.pkeep < 1.0:
             mask = torch.bernoulli(self.pkeep*torch.ones(z_indices.shape,
@@ -148,7 +155,7 @@ class Net2NetTransformer(pl.LightningModule):
 
     @torch.no_grad()
     def encode_to_z(self, x):
-        quant_z, _, info = self.first_stage_model.encode(x)
+        quant_z, _, info, _ = self.first_stage_model.encode(x)
         indices = info[2].view(quant_z.shape[0], -1)
         indices = self.permuter(indices)
         return quant_z, indices
@@ -157,8 +164,12 @@ class Net2NetTransformer(pl.LightningModule):
     def encode_to_c(self, c):
         if self.downsample_cond_size > -1:
             c = F.interpolate(c, size=(self.downsample_cond_size, self.downsample_cond_size))
-        quant_c, _, info = self.cond_stage_model.encode(c)
+        quant_c, _, info, connections = self.cond_stage_model.encode(c)
+        self.first_stage_model.c = c
+        self.first_stage_model.c_connections = connections
         indices = info[2].view(quant_c.shape[0], -1)
+        if not self.share_vocab:
+            indices += self.first_stage_model.quantize.n_e
         return quant_c, indices
 
     @torch.no_grad()
@@ -182,8 +193,8 @@ class Net2NetTransformer(pl.LightningModule):
         x = x.to(device=self.device)
         c = c.to(device=self.device)
 
-        quant_z, z_indices = self.encode_to_z(x)
         quant_c, c_indices = self.encode_to_c(c)
+        quant_z, z_indices = self.encode_to_z(x)
 
         # create a "half"" sample
         z_start_indices = z_indices[:,:z_indices.shape[1]//2]
