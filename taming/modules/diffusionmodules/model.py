@@ -341,7 +341,7 @@ class Model(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
-                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
+                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels, cond_channels,
                  resolution, z_channels, double_z=True, **ignore_kwargs):
         super().__init__()
         self.ch = ch
@@ -350,14 +350,19 @@ class Encoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
+        self.cond_channels = cond_channels
 
         # downsampling
-        self.conv_in = torch.nn.Conv2d(in_channels,
+        self.conv_in = torch.nn.Conv2d(in_channels+cond_channels,
                                        self.ch,
                                        kernel_size=3,
                                        stride=1,
                                        padding=1)
-
+        self.conv_cond = torch.nn.Conv2d(cond_channels,
+                                       self.ch,
+                                       kernel_size=3,
+                                       stride=1,
+                                       padding=1)
         curr_res = resolution
         in_ch_mult = (1,)+tuple(ch_mult)
         self.down = nn.ModuleList()
@@ -403,14 +408,19 @@ class Encoder(nn.Module):
                                         padding=1)
 
 
-    def forward(self, x):
+    def forward(self, x=None, cond=None):
+        assert cond is not None
         #assert x.shape[2] == x.shape[3] == self.resolution, "{}, {}, {}".format(x.shape[2], x.shape[3], self.resolution)
 
         # timestep embedding
         temb = None
 
         # downsampling
-        hs = [self.conv_in(x)]
+        inp = self.conv_cond(cond)
+        if x is not None:
+            _x = self.conv_in(torch.cat([x, cond], 1))
+            inp = torch.cat([_x, inp], 0)
+        hs = [inp]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
@@ -450,12 +460,12 @@ class Decoder(nn.Module):
         in_ch_mult = (1,)+tuple(ch_mult)
         block_in = ch*ch_mult[self.num_resolutions-1]
         curr_res = resolution // 2**(self.num_resolutions-1)
-        self.z_shape = (1,z_channels,curr_res,curr_res)
+        self.z_shape = (1,z_channels*2,curr_res,curr_res)
         print("Working with z of shape {} = {} dimensions.".format(
             self.z_shape, np.prod(self.z_shape)))
 
         # z to block_in
-        self.conv_in = torch.nn.Conv2d(z_channels,
+        self.conv_in = torch.nn.Conv2d(z_channels*2,
                                        block_in,
                                        kernel_size=3,
                                        stride=1,
@@ -503,7 +513,8 @@ class Decoder(nn.Module):
                                         stride=1,
                                         padding=1)
 
-    def forward(self, z):
+    def forward(self, z, z_cond):
+        z = torch.cat([z, z_cond], 1)
         #assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
 

@@ -17,11 +17,13 @@ class VQModel(pl.LightningModule):
                  ckpt_path=None,
                  ignore_keys=[],
                  image_key="image",
+                 cond_key="depth",
                  colorize_nlabels=None,
                  monitor=None
                  ):
         super().__init__()
         self.image_key = image_key
+        self.cond_key = cond_key
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
         self.loss = instantiate_from_config(lossconfig)
@@ -48,24 +50,33 @@ class VQModel(pl.LightningModule):
         self.load_state_dict(sd, strict=False)
         print(f"Restored from {path}")
 
-    def encode(self, x):
-        h = self.encoder(x)
+    def encode(self, x, cond):
+        h = self.encoder(x, cond)
         h = self.quant_conv(h)
+        h, h_cond = h.chunk(2, 0)
         quant, emb_loss, info = self.quantize(h)
+        quant = torch.cat([quant, h_cond], 0)
         return quant, emb_loss, info
 
     def decode(self, quant):
         quant = self.post_quant_conv(quant)
-        dec = self.decoder(quant)
+        quant, h_cond = quant.chunk(2, 0)
+        dec = self.decoder(quant, h_cond)
         return dec
 
-    def decode_code(self, code_b):
-        quant_b = self.quantize.embed_code(code_b)
-        dec = self.decode(quant_b)
+    def decode_code(self, code_b, cond):
+        h = self.encoder(cond=cond)
+        h_cond = self.quant_conv(h)
+        zshape = h_cond.shape
+        bhwc = (zshape[0],zshape[2],zshape[3],zshape[1])
+        quant_b = self.quantize.get_codebook_entry(
+            code_b.reshape(-1), shape=bhwc)
+        quant = torch.cat([quant_b, h_cond], 0)
+        dec = self.decode(quant)
         return dec
 
-    def forward(self, input):
-        quant, diff, _ = self.encode(input)
+    def forward(self, input, cond):
+        quant, diff, _ = self.encode(input, cond)
         dec = self.decode(quant)
         return dec, diff
 
@@ -78,7 +89,8 @@ class VQModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx, optimizer_idx):
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        cond = self.get_input(batch, self.cond_key)
+        xrec, qloss = self(x, cond)
 
         if optimizer_idx == 0:
             # autoencode
@@ -99,7 +111,8 @@ class VQModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        cond = self.get_input(batch, self.cond_key)
+        xrec, qloss = self(x, cond)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
                                             last_layer=self.get_last_layer(), split="val")
 
@@ -132,19 +145,26 @@ class VQModel(pl.LightningModule):
     def log_images(self, batch, **kwargs):
         log = dict()
         x = self.get_input(batch, self.image_key)
+        cond = self.get_input(batch, self.cond_key)
         x = x.to(self.device)
-        xrec, _ = self(x)
+        cond = cond.to(self.device)
+        _, _, info = self.encode(x, cond)
+        xrec = self.decode_code(info[-1], cond)
         if x.shape[1] > 3:
             # colorize with random projection
             assert xrec.shape[1] > 3
             x = self.to_rgb(x)
             xrec = self.to_rgb(xrec)
+        if cond.shape[1] > 3:
+            # colorize with random projection
+            cond = self.to_rgb(cond)
         log["inputs"] = x
+        log["conditions"] = cond
         log["reconstructions"] = xrec
         return log
 
     def to_rgb(self, x):
-        assert self.image_key == "segmentation"
+        assert self.image_key == "segmentation" or self.cond_key == "segmentation"
         if not hasattr(self, "colorize"):
             self.register_buffer("colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
         x = F.conv2d(x, weight=self.colorize)
@@ -169,14 +189,16 @@ class VQSegmentationModel(VQModel):
 
     def training_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        cond = self.get_input(batch, self.cond_key)
+        xrec, qloss = self(x, cond)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, split="train")
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
         return aeloss
 
     def validation_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        cond = self.get_input(batch, self.cond_key)
+        xrec, qloss = self(x, cond)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, split="val")
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
         total_loss = log_dict_ae["val/total_loss"]
@@ -188,8 +210,11 @@ class VQSegmentationModel(VQModel):
     def log_images(self, batch, **kwargs):
         log = dict()
         x = self.get_input(batch, self.image_key)
+        cond = self.get_input(batch, self.cond_key)
         x = x.to(self.device)
-        xrec, _ = self(x)
+        cond = cond.to(self.device)
+        _, _, info = self.encode(x, cond)
+        xrec = self.decode_code(info[-1], cond)
         if x.shape[1] > 3:
             # colorize with random projection
             assert xrec.shape[1] > 3
@@ -199,7 +224,11 @@ class VQSegmentationModel(VQModel):
             xrec = xrec.squeeze(1).permute(0, 3, 1, 2).float()
             x = self.to_rgb(x)
             xrec = self.to_rgb(xrec)
+        if cond.shape[1] > 3:
+            # colorize with random projection
+            cond = self.to_rgb(cond)
         log["inputs"] = x
+        log["conditions"] = cond
         log["reconstructions"] = xrec
         return log
 
@@ -213,15 +242,17 @@ class VQNoDiscModel(VQModel):
                  ckpt_path=None,
                  ignore_keys=[],
                  image_key="image",
+                 cond_key="depth",
                  colorize_nlabels=None
                  ):
         super().__init__(ddconfig=ddconfig, lossconfig=lossconfig, n_embed=n_embed, embed_dim=embed_dim,
-                         ckpt_path=ckpt_path, ignore_keys=ignore_keys, image_key=image_key,
+                         ckpt_path=ckpt_path, ignore_keys=ignore_keys, image_key=image_key, cond_key=cond_key,
                          colorize_nlabels=colorize_nlabels)
 
     def training_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        cond = self.get_input(batch, self.cond_key)
+        xrec, qloss = self(x, cond)
         # autoencode
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, self.global_step, split="train")
         output = pl.TrainResult(minimize=aeloss)
@@ -232,7 +263,8 @@ class VQNoDiscModel(VQModel):
 
     def validation_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        cond = self.get_input(batch, self.cond_key)
+        xrec, qloss = self(x, cond)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, self.global_step, split="val")
         rec_loss = log_dict_ae["val/rec_loss"]
         output = pl.EvalResult(checkpoint_on=rec_loss)
