@@ -17,15 +17,22 @@ class VQModel(pl.LightningModule):
                  ckpt_path=None,
                  ignore_keys=[],
                  image_key="image",
+                 source_key=None,
+                 use_quantize=True,
                  colorize_nlabels=None,
                  monitor=None
                  ):
         super().__init__()
         self.image_key = image_key
+        self.source_key = image_key if source_key is None else source_key
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
         self.loss = instantiate_from_config(lossconfig)
-        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
+        self.use_quantize = use_quantize
+        if use_quantize:
+            self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
+        else:
+            self.quantize = lambda h: h, torch.zeros(1, device=h.device), (None,None,h.permute(0,2,3,1).contiguous())
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         if ckpt_path is not None:
@@ -77,8 +84,9 @@ class VQModel(pl.LightningModule):
         return x.float()
 
     def training_step(self, batch, batch_idx, optimizer_idx):
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        xrec, qloss = self(xsrc)
 
         if optimizer_idx == 0:
             # autoencode
@@ -98,8 +106,9 @@ class VQModel(pl.LightningModule):
             return discloss
 
     def validation_step(self, batch, batch_idx):
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        xrec, qloss = self(xsrc)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
                                             last_layer=self.get_last_layer(), split="val")
 
@@ -131,15 +140,19 @@ class VQModel(pl.LightningModule):
 
     def log_images(self, batch, **kwargs):
         log = dict()
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
+        xsrc = xsrc.to(self.device)
         x = x.to(self.device)
-        xrec, _ = self(x)
+        xrec, _ = self(xsrc)
         if x.shape[1] > 3:
             # colorize with random projection
             assert xrec.shape[1] > 3
+            xsrc = self.to_rgb(xsrc)
             x = self.to_rgb(x)
             xrec = self.to_rgb(xrec)
-        log["inputs"] = x
+        log["inputs"] = xsrc
+        log["targets"] = x
         log["reconstructions"] = xrec
         return log
 
@@ -168,15 +181,17 @@ class VQSegmentationModel(VQModel):
         return opt_ae
 
     def training_step(self, batch, batch_idx):
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        xrec, qloss = self(xsrc)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, split="train")
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
         return aeloss
 
     def validation_step(self, batch, batch_idx):
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        xrec, qloss = self(xsrc)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, split="val")
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
         total_loss = log_dict_ae["val/total_loss"]
@@ -187,9 +202,11 @@ class VQSegmentationModel(VQModel):
     @torch.no_grad()
     def log_images(self, batch, **kwargs):
         log = dict()
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
+        xsrc = xsrc.to(self.device)
         x = x.to(self.device)
-        xrec, _ = self(x)
+        xrec, _ = self(xsrc)
         if x.shape[1] > 3:
             # colorize with random projection
             assert xrec.shape[1] > 3
@@ -197,9 +214,11 @@ class VQSegmentationModel(VQModel):
             xrec = torch.argmax(xrec, dim=1, keepdim=True)
             xrec = F.one_hot(xrec, num_classes=x.shape[1])
             xrec = xrec.squeeze(1).permute(0, 3, 1, 2).float()
+            xsrc = self.to_rgb(xsrc)
             x = self.to_rgb(x)
             xrec = self.to_rgb(xrec)
-        log["inputs"] = x
+        log["inputs"] = xsrc
+        log["targets"] = x
         log["reconstructions"] = xrec
         return log
 
@@ -220,8 +239,9 @@ class VQNoDiscModel(VQModel):
                          colorize_nlabels=colorize_nlabels)
 
     def training_step(self, batch, batch_idx):
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        xrec, qloss = self(xsrc)
         # autoencode
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, self.global_step, split="train")
         output = pl.TrainResult(minimize=aeloss)
@@ -231,8 +251,9 @@ class VQNoDiscModel(VQModel):
         return output
 
     def validation_step(self, batch, batch_idx):
+        xsrc = self.get_input(batch, self.source_key)
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        xrec, qloss = self(xsrc)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, self.global_step, split="val")
         rec_loss = log_dict_ae["val/rec_loss"]
         output = pl.EvalResult(checkpoint_on=rec_loss)

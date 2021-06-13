@@ -24,6 +24,8 @@ class Net2NetTransformer(pl.LightningModule):
         super().__init__()
         self.init_first_stage_from_ckpt(first_stage_config)
         self.init_cond_stage_from_ckpt(cond_stage_config)
+        self.cond_use_quantize = cond_stage_config["params"].get("cond_use_quantize", True)
+        transformer_config["params"]["cond_use_quantize"] = self.cond_use_quantize
         if permuter_config is None:
             permuter_config = {"target": "taming.modules.transformer.permuter.Identity"}
         self.permuter = instantiate_from_config(config=permuter_config)
@@ -72,13 +74,13 @@ class Net2NetTransformer(pl.LightningModule):
         else:
             a_indices = z_indices
 
-        cz_indices = torch.cat((c_indices, a_indices), dim=1)
+        cz_indices = torch.cat((c_indices, a_indices), dim=1) if self.cond_use_quantize else a_indices
 
         # target includes all sequence elements (no need to handle first one
         # differently because we are conditioning)
         target = z_indices
         # make the prediction
-        logits, _ = self.transformer(cz_indices[:, :-1])
+        logits, _ = self.transformer(cz_indices[:, :-1], cond=None if self.cond_use_quantize else c_indices)
         # cut off conditioning outputs - output i corresponds to p(z_i | z_{<i}, c)
         logits = logits[:, c_indices.shape[1]-1:]
 
@@ -93,12 +95,12 @@ class Net2NetTransformer(pl.LightningModule):
     @torch.no_grad()
     def sample(self, x, c, steps, temperature=1.0, sample=False, top_k=None,
                callback=lambda k: None):
-        x = torch.cat((c,x),dim=1)
+        x = torch.cat((c,x),dim=1) if self.cond_use_quantize else x
         block_size = self.transformer.get_block_size()
         assert not self.transformer.training
         if self.pkeep <= 0.0:
             # one pass suffices since input is pure noise anyway
-            assert len(x.shape)==2
+            assert len(x.shape)==2 and self.cond_use_quantize
             noise_shape = (x.shape[0], steps-1)
             #noise = torch.randint(self.transformer.config.vocab_size, noise_shape).to(x)
             noise = c.clone()[:,x.shape[1]-c.shape[1]:-1]
@@ -127,7 +129,7 @@ class Net2NetTransformer(pl.LightningModule):
                 callback(k)
                 assert x.size(1) <= block_size # make sure model can see conditioning
                 x_cond = x if x.size(1) <= block_size else x[:, -block_size:]  # crop context if needed
-                logits, _ = self.transformer(x_cond)
+                logits, _ = self.transformer(x_cond, cond=None if self.cond_use_quantize else c)
                 # pluck the logits at the final step and scale by temperature
                 logits = logits[:, -1, :] / temperature
                 # optionally crop probabilities to only the top k options
@@ -143,7 +145,7 @@ class Net2NetTransformer(pl.LightningModule):
                 # append to the sequence and continue
                 x = torch.cat((x, ix), dim=1)
             # cut off conditioning
-            x = x[:, c.shape[1]:]
+            x = x[:, c.shape[1]:] if self.cond_use_quantize else x
         return x
 
     @torch.no_grad()
@@ -158,7 +160,7 @@ class Net2NetTransformer(pl.LightningModule):
         if self.downsample_cond_size > -1:
             c = F.interpolate(c, size=(self.downsample_cond_size, self.downsample_cond_size))
         quant_c, _, info = self.cond_stage_model.encode(c)
-        indices = info[2].view(quant_c.shape[0], -1)
+        indices = info[2].view(quant_c.shape[0], -1) if self.cond_use_quantize else info[2].view(quant_c.shape[0], -1, quant_c.shape[1])
         return quant_c, indices
 
     @torch.no_grad()
